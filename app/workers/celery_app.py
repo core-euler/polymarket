@@ -1,0 +1,64 @@
+from celery import Celery
+
+from app.core.config import get_settings
+
+settings = get_settings()
+
+celery_app = Celery(
+    "polymarket_assistant",
+    broker=settings.celery_broker_url,
+    backend=settings.celery_result_backend,
+    include=["app.workers.tasks.pipeline"],
+)
+
+celery_app.conf.update(
+    task_serializer="json",
+    result_serializer="json",
+    accept_content=["json"],
+    timezone="UTC",
+    enable_utc=True,
+    beat_schedule={
+        # Список рынков обновляем раз в 15 минут
+        "market-refresh": {
+            "task": "app.workers.tasks.pipeline.market_refresh_task",
+            "schedule": 900.0,
+        },
+        # Снапшоты цен — раз в 5 минут
+        "market-snapshot-refresh": {
+            "task": "app.workers.tasks.pipeline.market_snapshot_task",
+            "schedule": 300.0,
+        },
+        # Новости — раз в 15 минут
+        "news-ingestion": {
+            "task": "app.workers.tasks.pipeline.news_ingestion_task",
+            "schedule": 900.0,
+        },
+        # LLM-анализ — раз в 2 минуты. Пустые тики дешёвые: если pending news нет,
+        # analyze_pending_news сразу возвращает 0. Дренаж очереди — через self-chain
+        # внутри таски, а не через частоту beat.
+        "news-analysis": {
+            "task": "app.workers.tasks.pipeline.news_analysis_task",
+            "schedule": 120.0,
+        },
+        # Сигналы — раз в 2 минуты, для подхвата analyses, не вызвавших chain.
+        "signal-generation": {
+            "task": "app.workers.tasks.pipeline.signal_generation_task",
+            "schedule": 120.0,
+        },
+        # Мониторинг открытых paper trades — раз в 5 минут
+        "paper-trade-monitoring": {
+            "task": "app.workers.tasks.pipeline.paper_trade_monitoring_task",
+            "schedule": 300.0,
+        },
+        # Авто-review и antipattern — раз в 30 минут
+        "auto-review": {
+            "task": "app.workers.tasks.pipeline.auto_review_task",
+            "schedule": 1800.0,
+        },
+        # Аналитика — раз в 30 минут
+        "analytics-refresh": {
+            "task": "app.workers.tasks.pipeline.analytics_refresh_task",
+            "schedule": 1800.0,
+        },
+    },
+)
