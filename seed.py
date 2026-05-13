@@ -37,14 +37,14 @@ from app.modules.signal_engine.service import SignalEngineModule
 
 DEFAULT_STRATEGY = {
     "profile_name": "default",
-    "version": 2,
+    "version": 3,
     "parameters_json": {
         "min_confidence": 0.55,
         "min_edge": 0.05,
         "min_liquidity": 500.0,
         "max_news_age_minutes": 1440,
         "min_confirming_sources": 1,
-        "default_position_size": 0.1,
+        "default_position_size": 1.0,
         "weak_confidence_threshold": 0.45,
         "informational_edge_threshold": 0.03,
         "paper_trade_confidence_threshold": 0.65,
@@ -59,11 +59,13 @@ DEFAULT_STRATEGY = {
     },
     "paper_trading_rules_json": {
         "auto_paper_trade_enabled": True,
-        "max_holding_minutes": 120,
-        # Absolute probability points — robust at any entry. 0.10 means
-        # "+10 ppt for us" regardless of entry price.
-        "take_profit_abs": 0.10,
-        "stop_loss_abs": 0.07,
+        "max_holding_minutes": 240,
+        # Absolute probability points — robust at any entry. 0.02 means
+        # "+2 ppt for us" regardless of entry price. Calibrated against v2
+        # data: max observed 120-min move was ~7 ppt, median 0.7 ppt — v2's
+        # 10 ppt threshold never triggered across 260 trades.
+        "take_profit_abs": 0.02,
+        "stop_loss_abs": 0.015,
         # Guard against bad ticks: ignore mark moves > this magnitude when
         # the market is still far from resolution.
         "max_mark_jump_per_tick": 0.5,
