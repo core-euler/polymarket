@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Market, MarketSnapshot, PaperTrade, Signal, StrategyConfig
@@ -32,6 +32,34 @@ class PaperTradingModule:
         active_strategy = await self._get_active_strategy(session)
         if active_strategy is None:
             return 0
+
+        now = datetime.now(timezone.utc)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        active_rules = active_strategy.paper_trading_rules_json or {}
+
+        # Risk layer (v4+): portfolio-level daily loss limit. If realized PnL
+        # for the active strategy over the current UTC day has breached the
+        # configured budget, stop opening NEW positions for the rest of the
+        # day. Open positions are still monitored and closed normally — we cap
+        # fresh risk, we do not panic-liquidate. Absent key → disabled, so
+        # older strategy versions are unaffected.
+        daily_loss_limit = float(active_rules.get("daily_loss_limit_abs", 0.0) or 0.0)
+        if daily_loss_limit > 0:
+            realized_today = await session.scalar(
+                select(func.coalesce(func.sum(PaperTrade.realized_pnl), 0.0)).where(
+                    PaperTrade.strategy_config_id == active_strategy.id,
+                    PaperTrade.status == "closed",
+                    PaperTrade.close_time >= day_start,
+                )
+            )
+            if float(realized_today or 0.0) <= -daily_loss_limit:
+                _log.warning(
+                    "open.halted_daily_loss_limit",
+                    strategy_id=active_strategy.id,
+                    realized_today=float(realized_today or 0.0),
+                    limit=daily_loss_limit,
+                )
+                return 0
 
         eligible_statuses = await self._eligible_signal_statuses(session)
         # Bind paper-trade openings to the currently active strategy. Old signals
@@ -67,6 +95,23 @@ class PaperTradingModule:
             if open_trade_for_market is not None:
                 continue
 
+            # Risk layer (v4+): cap how many trades a single market may spawn
+            # per UTC day. Without this, a market that keeps producing a
+            # candidate every snapshot serially churns hundreds of trades on
+            # one underlying (the v3 concentration failure: ~371 trades on a
+            # single decaying market). Absent key → disabled.
+            max_per_market = int(active_rules.get("max_trades_per_market_per_day", 0) or 0)
+            if max_per_market > 0:
+                market_trades_today = await session.scalar(
+                    select(func.count(PaperTrade.id)).where(
+                        PaperTrade.market_id == signal.market_id,
+                        PaperTrade.strategy_config_id == active_strategy.id,
+                        PaperTrade.open_time >= day_start,
+                    )
+                )
+                if int(market_trades_today or 0) >= max_per_market:
+                    continue
+
             strategy = await session.scalar(
                 select(StrategyConfig).where(StrategyConfig.id == signal.strategy_config_id)
             )
@@ -85,13 +130,31 @@ class PaperTradingModule:
             entry_price = float(signal.market_probability)
             direction = "YES" if signal.edge >= 0 else "NO"
 
+            # Risk layer (v4+): correlation guard. The clamp artifact in the
+            # signal engine makes the book structurally one-directional (e.g.
+            # all-NO on decaying markets); on a risk-off day that whole side
+            # hits stop-loss together (v3 2026-05-16: 384 SL in one day). Cap
+            # concurrent open trades per direction so the book cannot become a
+            # single one-way bet. Absent key → disabled.
+            max_same_dir = int(active_rules.get("max_same_direction_open", 0) or 0)
+            if max_same_dir > 0:
+                same_dir_open = await session.scalar(
+                    select(func.count(PaperTrade.id)).where(
+                        PaperTrade.strategy_config_id == active_strategy.id,
+                        PaperTrade.status == "open",
+                        PaperTrade.direction == direction,
+                    )
+                )
+                if int(same_dir_open or 0) >= max_same_dir:
+                    continue
+
             trade = PaperTrade(
                 signal_id=signal.id,
                 market_id=signal.market_id,
                 direction=direction,
                 entry_price=entry_price,
                 position_size=size,
-                open_time=datetime.now(timezone.utc),
+                open_time=now,
                 status="open",
                 open_reason="auto_from_signal",
                 strategy_config_id=signal.strategy_config_id,
@@ -99,6 +162,10 @@ class PaperTradingModule:
             )
             session.add(trade)
             account.balance -= size
+            # Flush so the per-market and per-direction counts above observe
+            # trades opened earlier in THIS cycle — otherwise a single pass
+            # could blow straight past every cap before the next commit.
+            await session.flush()
             created += 1
 
         await session.commit()

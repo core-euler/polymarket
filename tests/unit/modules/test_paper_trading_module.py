@@ -95,6 +95,92 @@ async def _seed_virtual_account(session: AsyncSession, balance: float = 1000.0) 
     return account
 
 
+async def _seed_bare_market(session: AsyncSession, pid: str) -> Market:
+    market = Market(
+        polymarket_id=pid,
+        slug=pid,
+        title=pid,
+        question="Q?",
+        topic="politics",
+        status="active",
+    )
+    session.add(market)
+    await session.flush()
+    return market
+
+
+async def _seed_existing_trade(
+    session: AsyncSession,
+    *,
+    strategy: StrategyConfig,
+    market: Market,
+    direction: str,
+    status: str,
+    realized_pnl: float | None = None,
+    open_time: datetime | None = None,
+    close_time: datetime | None = None,
+) -> PaperTrade:
+    # PaperTrade.signal_id is non-nullable — attach a throwaway signal/snapshot.
+    snapshot = MarketSnapshot(
+        market_id=market.id,
+        captured_at=datetime.now(timezone.utc),
+        last_price=0.5,
+        implied_probability=0.5,
+        liquidity=1000,
+        spread=0.02,
+        volume=10,
+        raw_payload={},
+    )
+    session.add(snapshot)
+    await session.flush()
+    sig = Signal(
+        market_id=market.id,
+        snapshot_id=snapshot.id,
+        market_probability=0.5,
+        model_probability=0.6,
+        edge=0.1,
+        confidence=0.8,
+        status="paper_trade_candidate",
+        explanation="seed",
+        risk_flags_json={},
+        strategy_config_id=strategy.id,
+        strategy_version="default:1",
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add(sig)
+    await session.flush()
+    trade = PaperTrade(
+        signal_id=sig.id,
+        market_id=market.id,
+        direction=direction,
+        entry_price=0.5,
+        position_size=1.0,
+        open_time=open_time or datetime.now(timezone.utc),
+        status=status,
+        open_reason="seed",
+        strategy_config_id=strategy.id,
+        strategy_version="default:1",
+        close_time=close_time,
+        realized_pnl=realized_pnl,
+        close_reason="seed" if status == "closed" else None,
+    )
+    session.add(trade)
+    await session.flush()
+    return trade
+
+
+def _risk_strategy(rules: dict) -> StrategyConfig:
+    return StrategyConfig(
+        profile_name="default",
+        version=4,
+        parameters_json={"default_position_size": 1.0},
+        paper_trading_rules_json={"auto_paper_trade_enabled": True, **rules},
+        antipattern_rules_json={},
+        active_flag=True,
+        created_at=datetime(2026, 5, 18, 10, 0, tzinfo=timezone.utc),
+    )
+
+
 async def test_open_eligible_trades_creates_trade_once(session: AsyncSession) -> None:
     strategy = await _seed_strategy(session)
     await _seed_virtual_account(session, balance=1000.0)
@@ -766,3 +852,204 @@ async def test_monitor_open_trades_closes_by_time_limit(session: AsyncSession) -
     assert refreshed.close_reason == "time_limit"
     assert refreshed.exit_price == 0.56
     assert refreshed.realized_pnl is not None
+
+
+# --- Risk layer (v4) regression tests --------------------------------------
+# v3 (1052 trades / 6 days) had no portfolio risk control: ~371 trades serially
+# churned on ONE decaying market, and one risk-off day lost -$11.56 with 384 SL
+# at once. These guards cap per-market churn, halt on a daily loss budget, and
+# stop the book becoming a single one-way bet. All are config-gated.
+
+
+async def test_open_eligible_trades_caps_trades_per_market_per_day(
+    session: AsyncSession,
+) -> None:
+    strategy = _risk_strategy({"max_trades_per_market_per_day": 2})
+    session.add(strategy)
+    await session.commit()
+    await _seed_virtual_account(session, balance=1000.0)
+    market, signal = await _seed_market_and_signal(session, strategy=strategy)
+    # Two trades already initiated on THIS market today (closed) → at the cap.
+    for _ in range(2):
+        await _seed_existing_trade(
+            session,
+            strategy=strategy,
+            market=market,
+            direction="YES",
+            status="closed",
+            realized_pnl=0.0,
+            close_time=datetime.now(timezone.utc),
+        )
+    await session.commit()
+
+    module = PaperTradingModule()
+    opened = await module.open_eligible_trades(session=session)
+
+    assert opened == 0
+    assert (
+        await session.scalar(
+            select(PaperTrade).where(PaperTrade.signal_id == signal.id)
+        )
+        is None
+    )
+
+
+async def test_open_eligible_trades_per_market_cap_allows_under_limit(
+    session: AsyncSession,
+) -> None:
+    strategy = _risk_strategy({"max_trades_per_market_per_day": 3})
+    session.add(strategy)
+    await session.commit()
+    await _seed_virtual_account(session, balance=1000.0)
+    market, signal = await _seed_market_and_signal(session, strategy=strategy)
+    # Only one prior (closed) trade today — still under the cap of 3.
+    await _seed_existing_trade(
+        session,
+        strategy=strategy,
+        market=market,
+        direction="YES",
+        status="closed",
+        realized_pnl=0.0,
+        close_time=datetime.now(timezone.utc),
+    )
+    await session.commit()
+
+    module = PaperTradingModule()
+    opened = await module.open_eligible_trades(session=session)
+
+    assert opened == 1
+    trade = await session.scalar(
+        select(PaperTrade).where(PaperTrade.signal_id == signal.id)
+    )
+    assert trade is not None and trade.status == "open"
+
+
+async def test_open_eligible_trades_halts_on_daily_loss_limit(
+    session: AsyncSession,
+) -> None:
+    strategy = _risk_strategy({"daily_loss_limit_abs": 1.0})
+    session.add(strategy)
+    await session.commit()
+    await _seed_virtual_account(session, balance=1000.0)
+    _market, signal = await _seed_market_and_signal(session, strategy=strategy)
+    losers = await _seed_bare_market(session, "pm_losers")
+    # Realized PnL today = -1.5 ≤ -daily_loss_limit_abs(1.0) → halt new opens.
+    await _seed_existing_trade(
+        session,
+        strategy=strategy,
+        market=losers,
+        direction="NO",
+        status="closed",
+        realized_pnl=-1.5,
+        close_time=datetime.now(timezone.utc),
+    )
+    await session.commit()
+
+    module = PaperTradingModule()
+    opened = await module.open_eligible_trades(session=session)
+
+    assert opened == 0
+    assert (
+        await session.scalar(
+            select(PaperTrade).where(PaperTrade.signal_id == signal.id)
+        )
+        is None
+    )
+
+
+async def test_open_eligible_trades_opens_when_under_daily_loss_limit(
+    session: AsyncSession,
+) -> None:
+    strategy = _risk_strategy({"daily_loss_limit_abs": 1.0})
+    session.add(strategy)
+    await session.commit()
+    await _seed_virtual_account(session, balance=1000.0)
+    _market, signal = await _seed_market_and_signal(session, strategy=strategy)
+    losers = await _seed_bare_market(session, "pm_losers")
+    # -0.5 is above the -1.0 budget → trading continues.
+    await _seed_existing_trade(
+        session,
+        strategy=strategy,
+        market=losers,
+        direction="NO",
+        status="closed",
+        realized_pnl=-0.5,
+        close_time=datetime.now(timezone.utc),
+    )
+    await session.commit()
+
+    module = PaperTradingModule()
+    opened = await module.open_eligible_trades(session=session)
+
+    assert opened == 1
+    trade = await session.scalar(
+        select(PaperTrade).where(PaperTrade.signal_id == signal.id)
+    )
+    assert trade is not None and trade.status == "open"
+
+
+async def test_open_eligible_trades_correlation_guard_caps_same_direction(
+    session: AsyncSession,
+) -> None:
+    strategy = _risk_strategy({"max_same_direction_open": 1})
+    session.add(strategy)
+    await session.commit()
+    await _seed_virtual_account(session, balance=1000.0)
+    # One YES already open on a different market → the YES side is at cap.
+    other = await _seed_bare_market(session, "pm_open_yes")
+    await _seed_existing_trade(
+        session,
+        strategy=strategy,
+        market=other,
+        direction="YES",
+        status="open",
+    )
+    # Fresh candidate (edge ≥ 0 → YES) on a new market must be blocked.
+    _market, signal = await _seed_market_and_signal(
+        session, strategy=strategy, edge=0.12
+    )
+    await session.commit()
+
+    module = PaperTradingModule()
+    opened = await module.open_eligible_trades(session=session)
+
+    assert opened == 0
+    assert (
+        await session.scalar(
+            select(PaperTrade).where(PaperTrade.signal_id == signal.id)
+        )
+        is None
+    )
+
+
+async def test_open_eligible_trades_correlation_guard_is_directional(
+    session: AsyncSession,
+) -> None:
+    # Guard is per-direction, not a blanket halt: a YES book at cap must not
+    # block a NO entry (a NO entry actually reduces book correlation).
+    strategy = _risk_strategy({"max_same_direction_open": 1})
+    session.add(strategy)
+    await session.commit()
+    await _seed_virtual_account(session, balance=1000.0)
+    other = await _seed_bare_market(session, "pm_open_yes")
+    await _seed_existing_trade(
+        session,
+        strategy=strategy,
+        market=other,
+        direction="YES",
+        status="open",
+    )
+    _market, signal = await _seed_market_and_signal(
+        session, strategy=strategy, status="paper_trade_candidate", edge=-0.2
+    )
+    await session.commit()
+
+    module = PaperTradingModule()
+    opened = await module.open_eligible_trades(session=session)
+
+    assert opened == 1
+    trade = await session.scalar(
+        select(PaperTrade).where(PaperTrade.signal_id == signal.id)
+    )
+    assert trade is not None
+    assert trade.direction == "NO"

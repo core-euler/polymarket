@@ -37,7 +37,7 @@ from app.modules.signal_engine.service import SignalEngineModule
 
 DEFAULT_STRATEGY = {
     "profile_name": "default",
-    "version": 3,
+    "version": 4,
     "parameters_json": {
         "min_confidence": 0.55,
         "min_edge": 0.05,
@@ -70,6 +70,30 @@ DEFAULT_STRATEGY = {
         # the market is still far from resolution.
         "max_mark_jump_per_tick": 0.5,
         "eligible_signal_statuses": ["paper_trade_candidate", "valid_signal"],
+        # --- Risk layer (v4) -------------------------------------------------
+        # v3 (1052 trades / 6 days) had no portfolio risk control. Its +9% was
+        # an artifact: ~371 trades serially churned on ONE decaying market
+        # (clamp-fabricated edge) while the real directional book lost
+        # -$12/6d with an uncontrolled -$11.56 tail day (384 SL at once).
+        # These three caps do NOT create edge — they remove the concentration
+        # mask and the tail so the engine's TRUE expectancy becomes visible
+        # without waiting for the Iran markets to resolve. Each is config so
+        # it can be tuned; absent key → guard disabled (older versions safe).
+        #
+        # 10: v3 ran ~210 trades/day over ~16-18 markets ≈ ~12/market/day
+        # organically; the concentration market ran ~62/day (~5x). Cap at 10
+        # ≈ the organic per-market rate → dominant market forced to parity,
+        # normal markets effectively unthrottled.
+        "max_trades_per_market_per_day": 10,
+        # 5.0 = 5% of the $100 account. v3 worst day was -$10.38 total; this
+        # halts NEW opens (open positions still close normally) roughly
+        # halfway through a 2026-05-16-type blowup, ~halving its damage.
+        "daily_loss_limit_abs": 5.0,
+        # 10: open book is ~16-18 slots (1/market). Capping same-direction
+        # concurrency at 10 forces ≥~8 the other way, so the clamp artifact
+        # cannot make the whole book a single one-way bet that all hits SL
+        # together on a risk-off day.
+        "max_same_direction_open": 10,
     },
     "antipattern_rules_json": {
         "confidence_penalty": 0.15,
