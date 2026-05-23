@@ -29,72 +29,21 @@ from app.db.models.entities import (
 )
 from app.db.session import SessionLocal
 from app.modules.llm_analysis.service import LLMAnalysisModule
+from app.modules.llm_trader.service import LLMTraderModule
 from app.modules.market_data.service import MarketDataModule
 from app.modules.news_ingestion.service import NewsIngestionModule
-from app.modules.paper_trading.service import PaperTradingModule
-from app.modules.signal_engine.service import SignalEngineModule
 
 
 DEFAULT_STRATEGY = {
     "profile_name": "default",
-    "version": 4,
-    "parameters_json": {
-        "min_confidence": 0.55,
-        "min_edge": 0.05,
-        "min_liquidity": 500.0,
-        "max_news_age_minutes": 1440,
-        "min_confirming_sources": 1,
-        "default_position_size": 1.0,
-        "weak_confidence_threshold": 0.45,
-        "informational_edge_threshold": 0.03,
-        "paper_trade_confidence_threshold": 0.65,
-        "paper_trade_edge_threshold": 0.06,
-        # Reject signals near probability extremes — TP/SL math and snapshot
-        # data are both unreliable there.
-        "min_market_probability": 0.05,
-        "max_market_probability": 0.95,
-        # Reject signals on markets with wide spread: we cannot actually
-        # trade (or close paper-trade) at a price that does not exist.
-        "max_allowed_spread": 0.10,
-    },
-    "paper_trading_rules_json": {
-        "auto_paper_trade_enabled": True,
-        "max_holding_minutes": 240,
-        # Absolute probability points — robust at any entry. 0.02 means
-        # "+2 ppt for us" regardless of entry price. Calibrated against v2
-        # data: max observed 120-min move was ~7 ppt, median 0.7 ppt — v2's
-        # 10 ppt threshold never triggered across 260 trades.
-        "take_profit_abs": 0.02,
-        "stop_loss_abs": 0.015,
-        # Guard against bad ticks: ignore mark moves > this magnitude when
-        # the market is still far from resolution.
-        "max_mark_jump_per_tick": 0.5,
-        "eligible_signal_statuses": ["paper_trade_candidate", "valid_signal"],
-        # --- Risk layer (v4) -------------------------------------------------
-        # v3 (1052 trades / 6 days) had no portfolio risk control. Its +9% was
-        # an artifact: ~371 trades serially churned on ONE decaying market
-        # (clamp-fabricated edge) while the real directional book lost
-        # -$12/6d with an uncontrolled -$11.56 tail day (384 SL at once).
-        # These three caps do NOT create edge — they remove the concentration
-        # mask and the tail so the engine's TRUE expectancy becomes visible
-        # without waiting for the Iran markets to resolve. Each is config so
-        # it can be tuned; absent key → guard disabled (older versions safe).
-        #
-        # 10: v3 ran ~210 trades/day over ~16-18 markets ≈ ~12/market/day
-        # organically; the concentration market ran ~62/day (~5x). Cap at 10
-        # ≈ the organic per-market rate → dominant market forced to parity,
-        # normal markets effectively unthrottled.
-        "max_trades_per_market_per_day": 10,
-        # 5.0 = 5% of the $100 account. v3 worst day was -$10.38 total; this
-        # halts NEW opens (open positions still close normally) roughly
-        # halfway through a 2026-05-16-type blowup, ~halving its damage.
-        "daily_loss_limit_abs": 5.0,
-        # 10: open book is ~16-18 slots (1/market). Capping same-direction
-        # concurrency at 10 forces ≥~8 the other way, so the clamp artifact
-        # cannot make the whole book a single one-way bet that all hits SL
-        # together on a risk-off day.
-        "max_same_direction_open": 10,
-    },
+    "version": 5,
+    # v5 — LLM-as-trader. The signal engine and the paper-trading rule layer
+    # are retired (docs/STRATEGY_JOURNAL.md, v5). The trader LLM decides
+    # open/close/hold/adjust, side, size and risk directly from analysis +
+    # price + portfolio. There are intentionally NO edge thresholds and NO
+    # code-level trading rules here — judgment lives in the model + prompt.
+    "parameters_json": {},
+    "paper_trading_rules_json": {},
     "antipattern_rules_json": {
         "confidence_penalty": 0.15,
         "block_auto_trade_on_match": True,
@@ -314,10 +263,9 @@ async def drain_llm_pipeline(
     feed cannot loop forever.
     """
     llm_module = LLMAnalysisModule()
-    signal_module = SignalEngineModule()
-    paper_module = PaperTradingModule()
+    trader_module = LLMTraderModule()
 
-    totals = {"analyses": 0, "signals": 0, "trades_opened": 0, "trades_closed": 0}
+    totals = {"analyses": 0, "trades": 0}
 
     for iteration in range(1, max_iterations + 1):
         analyses = await _run_step(
@@ -329,20 +277,10 @@ async def drain_llm_pipeline(
         if analyses == 0:
             break
 
-    totals["signals"] = await _run_step(
-        name="signal_generation",
+    totals["trades"] = await _run_step(
+        name="llm_trader",
         session=session,
-        action=lambda: signal_module.generate_signals(session),
-    )
-    totals["trades_opened"] = await _run_step(
-        name="paper_trade_open",
-        session=session,
-        action=lambda: paper_module.open_eligible_trades(session),
-    )
-    totals["trades_closed"] = await _run_step(
-        name="paper_trade_monitor",
-        session=session,
-        action=lambda: paper_module.monitor_open_trades(session),
+        action=lambda: trader_module.run_cycle(session),
     )
     return totals
 

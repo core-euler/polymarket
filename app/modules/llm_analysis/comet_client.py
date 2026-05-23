@@ -6,19 +6,21 @@ from app.core.config import get_settings
 
 
 class CometAPIClient:
-    def __init__(self) -> None:
+    def __init__(self, model: str | None = None, *, timeout: float = 30.0) -> None:
         settings = get_settings()
         self.api_key = settings.comet_api_key
-        self.model = settings.comet_model_default
+        # Per-instance model override: news analysis uses comet_model_default,
+        # the LLM-trader passes comet_model_trader. Falls back to the default.
+        self.model = model or settings.comet_model_default
         self.base_url = "https://api.cometapi.com"
-        self._timeout = httpx.Timeout(30.0)
+        self._timeout = httpx.Timeout(timeout)
 
-    async def analyze_text(self, prompt: str) -> dict[str, Any]:
+    async def analyze_text(self, prompt: str, *, model: str | None = None) -> dict[str, Any]:
         if not self.api_key:
             raise RuntimeError("COMET_API_KEY is required")
 
         payload = {
-            "model": self.model,
+            "model": model or self.model,
             "messages": [{"role": "user", "content": prompt}],
         }
         headers = {"Authorization": f"Bearer {self.api_key}"}

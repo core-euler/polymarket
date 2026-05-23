@@ -182,7 +182,10 @@ class PaperTrade(Base):
     __tablename__ = "paper_trades"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    signal_id: Mapped[int] = mapped_column(ForeignKey("signals.id"), index=True)
+    # v5 (LLM-as-trader): trades open from llm_decisions, not signals, so this
+    # is nullable. Older versions still set it. NOTE: create_all does not alter
+    # existing columns — this relaxation takes effect only after a DB wipe.
+    signal_id: Mapped[Optional[int]] = mapped_column(ForeignKey("signals.id"), nullable=True, index=True)
     market_id: Mapped[int] = mapped_column(ForeignKey("markets.id"), index=True)
     direction: Mapped[str] = mapped_column(String(16))
     entry_price: Mapped[float] = mapped_column(Float)
@@ -196,6 +199,50 @@ class PaperTrade(Base):
     close_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     close_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     realized_pnl: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+
+class LLMDecision(Base):
+    """v5 decision log — the validation backbone for LLM-as-trader.
+
+    One row per decision the trader LLM emits (open/close/hold/adjust), with
+    the full rationale and the price at decision time. Grading columns
+    (price_t*, resolved_outcome) are filled later by a scorer so we can measure
+    calibration and whether the trader beats the market. This is NOT a risk
+    control — it is measurement, and it is non-negotiable: without it we cannot
+    tell real edge from another decay-harvest artifact.
+    """
+
+    __tablename__ = "llm_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_id: Mapped[int] = mapped_column(ForeignKey("markets.id"), index=True)
+    strategy_config_id: Mapped[int] = mapped_column(ForeignKey("strategy_configs.id"), index=True)
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    # open | close | hold | adjust
+    action: Mapped[str] = mapped_column(String(16), index=True)
+    side: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)  # YES | NO
+    size: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    rationale: Mapped[str] = mapped_column(Text, default="")
+    price_at_decision: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    model_name: Mapped[str] = mapped_column(String(128), default="")
+    # new_analysis | price_move | …
+    trigger_reason: Mapped[str] = mapped_column(String(64), default="")
+    paper_trade_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("paper_trades.id"), nullable=True, index=True
+    )
+    executed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    # e.g. "skipped: null price" — data-integrity carve-out record
+    execution_note: Mapped[str] = mapped_column(Text, default="")
+    trace_json: Mapped[dict] = mapped_column(JSON, default=dict)  # prompt/response
+    # --- grading (filled later by the scorer) ----------------------------
+    price_t1h: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    price_t4h: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    price_t24h: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    resolved_outcome: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
 
 
 class ErrorReview(Base):

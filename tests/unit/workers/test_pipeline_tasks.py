@@ -47,17 +47,6 @@ class _FakeNewsModule:
         return 4
 
 
-class _FakeSignalModule:
-    def __init__(self, expected_session: object) -> None:
-        self.expected_session = expected_session
-        self.generate_called = False
-
-    async def generate_signals(self, session) -> int:
-        assert session is self.expected_session
-        self.generate_called = True
-        return 6
-
-
 class _FakeLLMModule:
     def __init__(self, expected_session: object) -> None:
         self.expected_session = expected_session
@@ -69,21 +58,15 @@ class _FakeLLMModule:
         return 11
 
 
-class _FakePaperModule:
+class _FakeTraderModule:
     def __init__(self, expected_session: object) -> None:
         self.expected_session = expected_session
-        self.open_called = False
-        self.monitor_called = False
+        self.called = False
 
-    async def open_eligible_trades(self, session) -> int:
+    async def run_cycle(self, session) -> int:
         assert session is self.expected_session
-        self.open_called = True
-        return 2
-
-    async def monitor_open_trades(self, session) -> int:
-        assert session is self.expected_session
-        self.monitor_called = True
-        return 3
+        self.called = True
+        return 8
 
 
 class _FakeReviewModule:
@@ -176,48 +159,23 @@ def test_news_ingestion_task_uses_sync_runner(monkeypatch) -> None:
     assert result == "news_ingestion_task completed: 12"
 
 
-async def test_run_signal_generation_job_calls_signal_module() -> None:
+async def test_run_llm_trader_job_calls_trader_module() -> None:
     session = object()
-    module = _FakeSignalModule(expected_session=session)
+    module = _FakeTraderModule(expected_session=session)
 
-    processed = await pipeline.run_signal_generation_job(
+    processed = await pipeline.run_llm_trader_job(
         session_factory=_session_factory(session),
         module_factory=lambda: module,
     )
 
-    assert processed == 6
-    assert module.generate_called is True
+    assert processed == 8
+    assert module.called is True
 
 
-def test_signal_generation_task_uses_sync_runner(monkeypatch) -> None:
-    monkeypatch.setattr(pipeline, "run_signal_generation_job_sync", lambda: 15)
-    monkeypatch.setattr(
-        pipeline.paper_trade_monitoring_task, "delay", lambda *a, **k: None
-    )
-    result = pipeline.signal_generation_task()
-    assert result == "signal_generation_task completed: 15"
-
-
-def test_signal_generation_task_chains_paper_trade_monitor(monkeypatch) -> None:
-    chained: list[bool] = []
-    monkeypatch.setattr(pipeline, "run_signal_generation_job_sync", lambda: 7)
-    monkeypatch.setattr(
-        pipeline.paper_trade_monitoring_task, "delay",
-        lambda *a, **k: chained.append(True),
-    )
-    pipeline.signal_generation_task()
-    assert chained == [True]
-
-
-def test_signal_generation_task_skips_chain_when_zero(monkeypatch) -> None:
-    chained: list[bool] = []
-    monkeypatch.setattr(pipeline, "run_signal_generation_job_sync", lambda: 0)
-    monkeypatch.setattr(
-        pipeline.paper_trade_monitoring_task, "delay",
-        lambda *a, **k: chained.append(True),
-    )
-    pipeline.signal_generation_task()
-    assert chained == []
+def test_llm_trader_task_uses_sync_runner(monkeypatch) -> None:
+    monkeypatch.setattr(pipeline, "run_llm_trader_job_sync", lambda: 4)
+    result = pipeline.llm_trader_task()
+    assert result == "llm_trader_task completed: 4"
 
 
 async def test_run_news_analysis_job_calls_llm_module() -> None:
@@ -236,27 +194,20 @@ async def test_run_news_analysis_job_calls_llm_module() -> None:
 def test_news_analysis_task_uses_sync_runner(monkeypatch) -> None:
     monkeypatch.setattr(pipeline, "run_news_analysis_job_sync", lambda: 11)
     monkeypatch.setattr(pipeline, "count_pending_news_sync", lambda: 0)
-    monkeypatch.setattr(
-        pipeline.signal_generation_task, "delay", lambda *a, **k: None
-    )
-    monkeypatch.setattr(
-        pipeline.news_analysis_task, "delay", lambda *a, **k: None
-    )
+    monkeypatch.setattr(pipeline.llm_trader_task, "delay", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline.news_analysis_task, "delay", lambda *a, **k: None)
     result = pipeline.news_analysis_task()
     assert result == "news_analysis_task completed: 11"
 
 
-def test_news_analysis_task_chains_signal_generation(monkeypatch) -> None:
+def test_news_analysis_task_chains_llm_trader(monkeypatch) -> None:
     chained: list[bool] = []
     monkeypatch.setattr(pipeline, "run_news_analysis_job_sync", lambda: 4)
     monkeypatch.setattr(pipeline, "count_pending_news_sync", lambda: 0)
     monkeypatch.setattr(
-        pipeline.signal_generation_task, "delay",
-        lambda *a, **k: chained.append(True),
+        pipeline.llm_trader_task, "delay", lambda *a, **k: chained.append(True)
     )
-    monkeypatch.setattr(
-        pipeline.news_analysis_task, "delay", lambda *a, **k: None
-    )
+    monkeypatch.setattr(pipeline.news_analysis_task, "delay", lambda *a, **k: None)
     pipeline.news_analysis_task()
     assert chained == [True]
 
@@ -266,12 +217,9 @@ def test_news_analysis_task_skips_chain_when_zero(monkeypatch) -> None:
     monkeypatch.setattr(pipeline, "run_news_analysis_job_sync", lambda: 0)
     monkeypatch.setattr(pipeline, "count_pending_news_sync", lambda: 0)
     monkeypatch.setattr(
-        pipeline.signal_generation_task, "delay",
-        lambda *a, **k: chained.append(True),
+        pipeline.llm_trader_task, "delay", lambda *a, **k: chained.append(True)
     )
-    monkeypatch.setattr(
-        pipeline.news_analysis_task, "delay", lambda *a, **k: None
-    )
+    monkeypatch.setattr(pipeline.news_analysis_task, "delay", lambda *a, **k: None)
     pipeline.news_analysis_task()
     assert chained == []
 
@@ -280,9 +228,7 @@ def test_news_analysis_task_self_chains_when_pending_remains(monkeypatch) -> Non
     self_chained: list[bool] = []
     monkeypatch.setattr(pipeline, "run_news_analysis_job_sync", lambda: 5)
     monkeypatch.setattr(pipeline, "count_pending_news_sync", lambda: 17)
-    monkeypatch.setattr(
-        pipeline.signal_generation_task, "delay", lambda *a, **k: None
-    )
+    monkeypatch.setattr(pipeline.llm_trader_task, "delay", lambda *a, **k: None)
     monkeypatch.setattr(
         pipeline.news_analysis_task, "delay",
         lambda *a, **k: self_chained.append(True),
@@ -295,35 +241,13 @@ def test_news_analysis_task_no_self_chain_when_queue_empty(monkeypatch) -> None:
     self_chained: list[bool] = []
     monkeypatch.setattr(pipeline, "run_news_analysis_job_sync", lambda: 5)
     monkeypatch.setattr(pipeline, "count_pending_news_sync", lambda: 0)
-    monkeypatch.setattr(
-        pipeline.signal_generation_task, "delay", lambda *a, **k: None
-    )
+    monkeypatch.setattr(pipeline.llm_trader_task, "delay", lambda *a, **k: None)
     monkeypatch.setattr(
         pipeline.news_analysis_task, "delay",
         lambda *a, **k: self_chained.append(True),
     )
     pipeline.news_analysis_task()
     assert self_chained == []
-
-
-async def test_run_paper_trade_monitoring_job_calls_paper_module() -> None:
-    session = object()
-    module = _FakePaperModule(expected_session=session)
-
-    processed = await pipeline.run_paper_trade_monitoring_job(
-        session_factory=_session_factory(session),
-        module_factory=lambda: module,
-    )
-
-    assert processed == 5
-    assert module.open_called is True
-    assert module.monitor_called is True
-
-
-def test_paper_trade_monitoring_task_uses_sync_runner(monkeypatch) -> None:
-    monkeypatch.setattr(pipeline, "run_paper_trade_monitoring_job_sync", lambda: 5)
-    result = pipeline.paper_trade_monitoring_task()
-    assert result == "paper_trade_monitoring_task completed: 5"
 
 
 async def test_run_auto_review_job_calls_review_and_antipattern_modules() -> None:

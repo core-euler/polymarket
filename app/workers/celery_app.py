@@ -40,14 +40,12 @@ celery_app.conf.update(
             "task": "app.workers.tasks.pipeline.news_analysis_task",
             "schedule": 120.0,
         },
-        # Сигналы — раз в 2 минуты, для подхвата analyses, не вызвавших chain.
-        "signal-generation": {
-            "task": "app.workers.tasks.pipeline.signal_generation_task",
-            "schedule": 120.0,
-        },
-        # Мониторинг открытых paper trades — раз в 5 минут
-        "paper-trade-monitoring": {
-            "task": "app.workers.tasks.pipeline.paper_trade_monitoring_task",
+        # v5: LLM-трейдер. Событийно дёргается из news_analysis_task при новых
+        # анализах; этот beat-тик (раз в 5 мин, в такт снапшотам) ловит
+        # триггеры по движению цены. Пустые тики дешёвые: нет «грязных»
+        # рынков → run_cycle сразу возвращает 0 без вызова LLM.
+        "llm-trader": {
+            "task": "app.workers.tasks.pipeline.llm_trader_task",
             "schedule": 300.0,
         },
         # Авто-review и antipattern — раз в 30 минут

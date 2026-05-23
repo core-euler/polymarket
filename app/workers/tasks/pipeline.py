@@ -10,10 +10,9 @@ from app.modules.analytics.service import AnalyticsModule
 from app.modules.antipattern.service import AntipatternModule
 from app.modules.error_review.service import ErrorReviewModule
 from app.modules.llm_analysis.service import LLMAnalysisModule
+from app.modules.llm_trader.service import LLMTraderModule
 from app.modules.market_data.service import MarketDataModule
 from app.modules.news_ingestion.service import NewsIngestionModule
-from app.modules.paper_trading.service import PaperTradingModule
-from app.modules.signal_engine.service import SignalEngineModule
 from app.workers.celery_app import celery_app
 
 
@@ -87,32 +86,17 @@ def count_pending_news_sync() -> int:
     return asyncio.run(count_pending_news())
 
 
-async def run_signal_generation_job(
+async def run_llm_trader_job(
     session_factory: Callable[[], Any] = SessionLocal,
-    module_factory: Callable[[], Any] = SignalEngineModule,
+    module_factory: Callable[[], Any] = LLMTraderModule,
 ) -> int:
     module = module_factory()
     async with session_factory() as session:
-        return await module.generate_signals(session)
+        return await module.run_cycle(session)
 
 
-def run_signal_generation_job_sync() -> int:
-    return asyncio.run(run_signal_generation_job())
-
-
-async def run_paper_trade_monitoring_job(
-    session_factory: Callable[[], Any] = SessionLocal,
-    module_factory: Callable[[], Any] = PaperTradingModule,
-) -> int:
-    module = module_factory()
-    async with session_factory() as session:
-        opened = await module.open_eligible_trades(session)
-        closed = await module.monitor_open_trades(session)
-        return opened + closed
-
-
-def run_paper_trade_monitoring_job_sync() -> int:
-    return asyncio.run(run_paper_trade_monitoring_job())
+def run_llm_trader_job_sync() -> int:
+    return asyncio.run(run_llm_trader_job())
 
 
 async def run_auto_review_job(
@@ -167,7 +151,8 @@ def news_ingestion_task() -> str:
 def news_analysis_task() -> str:
     processed = run_news_analysis_job_sync()
     if processed > 0:
-        signal_generation_task.delay()
+        # New analyses make markets "dirty" → run the LLM trader event-driven.
+        llm_trader_task.delay()
     # Self-chain: модуль работает батчами по batch_size, а ingestion поднимает
     # сразу всю RSS-простыню. Если очередь не осушена, дёрнем себя ещё раз
     # вместо того чтобы ждать следующего beat-тика.
@@ -177,17 +162,9 @@ def news_analysis_task() -> str:
 
 
 @celery_app.task
-def signal_generation_task() -> str:
-    processed = run_signal_generation_job_sync()
-    if processed > 0:
-        paper_trade_monitoring_task.delay()
-    return f"signal_generation_task completed: {processed}"
-
-
-@celery_app.task
-def paper_trade_monitoring_task() -> str:
-    processed = run_paper_trade_monitoring_job_sync()
-    return f"paper_trade_monitoring_task completed: {processed}"
+def llm_trader_task() -> str:
+    processed = run_llm_trader_job_sync()
+    return f"llm_trader_task completed: {processed}"
 
 
 @celery_app.task

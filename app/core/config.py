@@ -41,7 +41,11 @@ class Settings(BaseSettings):
     )
 
     comet_api_key: str = Field(default="", alias="COMET_API_KEY")
+    # Cheap model: news relevance + compression (high call count).
     comet_model_default: str = Field(default="", alias="COMET_MODEL_DEFAULT")
+    # Strong model: the LLM-trader's decisions (low call count, high stakes).
+    # Falls back to comet_model_default when unset.
+    comet_model_trader: str = Field(default="", alias="COMET_MODEL_TRADER")
 
     seed_run_llm: bool = Field(default=False, alias="SEED_RUN_LLM")
     seed_drain_max_iterations: int = Field(default=20, alias="SEED_DRAIN_MAX_ITERATIONS")

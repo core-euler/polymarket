@@ -84,7 +84,7 @@ async def real_session() -> AsyncSession:
     await engine.dispose()
 
 
-async def test_ensure_core_defaults_creates_v2_when_db_empty(real_session: AsyncSession) -> None:
+async def test_ensure_core_defaults_creates_default_when_db_empty(real_session: AsyncSession) -> None:
     await seed.ensure_core_defaults(real_session)
 
     rows = list(
@@ -93,10 +93,11 @@ async def test_ensure_core_defaults_creates_v2_when_db_empty(real_session: Async
         )
     )
     assert len(rows) == 1
-    assert rows[0].version == 2
+    assert rows[0].version == seed.DEFAULT_STRATEGY["version"]
     assert rows[0].active_flag is True
-    assert rows[0].parameters_json["min_market_probability"] == 0.05
-    assert rows[0].paper_trading_rules_json["take_profit_abs"] == 0.10
+    # v5 retired the edge/rule params — both config blobs are empty.
+    assert rows[0].parameters_json == seed.DEFAULT_STRATEGY["parameters_json"]
+    assert rows[0].paper_trading_rules_json == seed.DEFAULT_STRATEGY["paper_trading_rules_json"]
 
 
 async def test_ensure_core_defaults_deactivates_legacy_v1(real_session: AsyncSession) -> None:
@@ -121,19 +122,19 @@ async def test_ensure_core_defaults_deactivates_legacy_v1(real_session: AsyncSes
             select(StrategyConfig).order_by(StrategyConfig.version.asc())
         )
     )
-    assert [r.version for r in rows] == [1, 2]
+    assert [r.version for r in rows] == [1, seed.DEFAULT_STRATEGY["version"]]
     assert rows[0].active_flag is False  # legacy deactivated
     assert rows[1].active_flag is True
-    assert rows[1].parameters_json["max_market_probability"] == 0.95
+    assert rows[1].parameters_json == seed.DEFAULT_STRATEGY["parameters_json"]
 
 
-async def test_ensure_core_defaults_idempotent_when_v2_exists(real_session: AsyncSession) -> None:
+async def test_ensure_core_defaults_idempotent_when_default_exists(real_session: AsyncSession) -> None:
     await seed.ensure_core_defaults(real_session)
     await seed.ensure_core_defaults(real_session)
 
     rows = list(await real_session.scalars(select(StrategyConfig)))
     assert len(rows) == 1
-    assert rows[0].version == 2
+    assert rows[0].version == seed.DEFAULT_STRATEGY["version"]
 
 
 async def test_run_initial_pipeline_continues_after_failed_step(monkeypatch) -> None:
