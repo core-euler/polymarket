@@ -48,6 +48,13 @@ celery_app.conf.update(
             "task": "app.workers.tasks.pipeline.llm_trader_task",
             "schedule": 300.0,
         },
+        # v5: грейдер решений. Раз в 10 минут заполняет цены через 1ч/4ч/24ч
+        # и исход рынка в llm_decisions — это измеритель калибровки/edge.
+        # Идемпотентен: пишет только в NULL-поля, пустые тики дешёвые.
+        "llm-scorer": {
+            "task": "app.workers.tasks.pipeline.llm_scorer_task",
+            "schedule": 600.0,
+        },
         # Авто-review и antipattern — раз в 30 минут
         "auto-review": {
             "task": "app.workers.tasks.pipeline.auto_review_task",

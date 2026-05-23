@@ -10,6 +10,7 @@ from app.modules.analytics.service import AnalyticsModule
 from app.modules.antipattern.service import AntipatternModule
 from app.modules.error_review.service import ErrorReviewModule
 from app.modules.llm_analysis.service import LLMAnalysisModule
+from app.modules.llm_scorer.service import LLMScorerModule
 from app.modules.llm_trader.service import LLMTraderModule
 from app.modules.market_data.service import MarketDataModule
 from app.modules.news_ingestion.service import NewsIngestionModule
@@ -99,6 +100,19 @@ def run_llm_trader_job_sync() -> int:
     return asyncio.run(run_llm_trader_job())
 
 
+async def run_llm_scorer_job(
+    session_factory: Callable[[], Any] = SessionLocal,
+    module_factory: Callable[[], Any] = LLMScorerModule,
+) -> dict[str, int]:
+    module = module_factory()
+    async with session_factory() as session:
+        return await module.run_cycle(session)
+
+
+def run_llm_scorer_job_sync() -> dict[str, int]:
+    return asyncio.run(run_llm_scorer_job())
+
+
 async def run_auto_review_job(
     session_factory: Callable[[], Any] = SessionLocal,
     review_module_factory: Callable[[], Any] = ErrorReviewModule,
@@ -165,6 +179,15 @@ def news_analysis_task() -> str:
 def llm_trader_task() -> str:
     processed = run_llm_trader_job_sync()
     return f"llm_trader_task completed: {processed}"
+
+
+@celery_app.task
+def llm_scorer_task() -> str:
+    result = run_llm_scorer_job_sync()
+    return (
+        f"llm_scorer_task completed: prices={result['prices']} "
+        f"resolutions={result['resolutions']}"
+    )
 
 
 @celery_app.task

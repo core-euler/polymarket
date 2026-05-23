@@ -29,7 +29,7 @@ async def run_bot() -> None:
             bot_username=me.username,
             allowed_user_ids=settings.telegram_allowed_user_ids,
         )
-        await bot.delete_webhook(drop_pending_updates=False)
+        await bot.delete_webhook(drop_pending_updates=True)
         logger.info("webhook_disabled_for_polling")
         await dispatcher.start_polling(bot)
     except TelegramAPIError as exc:

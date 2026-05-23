@@ -69,6 +69,17 @@ class _FakeTraderModule:
         return 8
 
 
+class _FakeScorerModule:
+    def __init__(self, expected_session: object) -> None:
+        self.expected_session = expected_session
+        self.called = False
+
+    async def run_cycle(self, session) -> dict[str, int]:
+        assert session is self.expected_session
+        self.called = True
+        return {"prices": 2, "resolutions": 1}
+
+
 class _FakeReviewModule:
     def __init__(self, expected_session: object) -> None:
         self.expected_session = expected_session
@@ -176,6 +187,27 @@ def test_llm_trader_task_uses_sync_runner(monkeypatch) -> None:
     monkeypatch.setattr(pipeline, "run_llm_trader_job_sync", lambda: 4)
     result = pipeline.llm_trader_task()
     assert result == "llm_trader_task completed: 4"
+
+
+async def test_run_llm_scorer_job_calls_scorer_module() -> None:
+    session = object()
+    module = _FakeScorerModule(expected_session=session)
+
+    result = await pipeline.run_llm_scorer_job(
+        session_factory=_session_factory(session),
+        module_factory=lambda: module,
+    )
+
+    assert result == {"prices": 2, "resolutions": 1}
+    assert module.called is True
+
+
+def test_llm_scorer_task_uses_sync_runner(monkeypatch) -> None:
+    monkeypatch.setattr(
+        pipeline, "run_llm_scorer_job_sync", lambda: {"prices": 3, "resolutions": 2}
+    )
+    result = pipeline.llm_scorer_task()
+    assert result == "llm_scorer_task completed: prices=3 resolutions=2"
 
 
 async def test_run_news_analysis_job_calls_llm_module() -> None:
