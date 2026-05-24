@@ -231,6 +231,7 @@ async def test_report_calibration_and_edge_isolation(session: AsyncSession) -> N
 
     report = await build_report(session)
 
+    assert report["horizon"] == "t24h"
     assert report["directional_n"] == 3
     assert report["edge"]["near_resolution"]["n"] == 1
     assert report["edge"]["core"]["n"] == 2
@@ -240,3 +241,23 @@ async def test_report_calibration_and_edge_isolation(session: AsyncSession) -> N
     high_band = next(b for b in report["calibration"] if b["band"].startswith("[0.85"))
     assert high_band["n"] == 1
     assert high_band["favorable_rate"] == pytest.approx(1.0)
+
+
+async def test_report_honors_shorter_horizon(session: AsyncSession) -> None:
+    strategy = await _seed_strategy(session)
+    market = await _seed_market(session, "m1")
+    now = datetime.now(timezone.utc)
+    # Only the +1h horizon is graded; +24h is still NULL (decision is young).
+    await _seed_decision(
+        session, strategy_id=strategy.id, market_id=market.id, decided_at=now,
+        side="YES", price_at_decision=0.40, confidence=0.9, price_t1h=0.55,
+    )
+    await session.commit()
+
+    t1h = await build_report(session, horizon="t1h")
+    t24h = await build_report(session, horizon="t24h")
+
+    assert t1h["horizon"] == "t1h"
+    assert t1h["directional_n"] == 1  # graded at +1h
+    assert t1h["edge"]["core"]["favorable_rate"] == pytest.approx(1.0)
+    assert t24h["directional_n"] == 0  # not yet graded at +24h

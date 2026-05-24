@@ -7,10 +7,12 @@ Answers the only two questions that matter for LLM-as-trader:
      near-resolution markets (the longshot-decay zone that faked edge in
      v1-v4) are removed?
 
-"Favorable" = the market's YES-probability moved in the call's direction by
-+24h (YES -> price rose, NO -> price fell). This is a market-prediction
-metric, independent of position sizing, so a few concentrated bets cannot
-masquerade as skill the way headline PnL did.
+"Favorable" = the market's YES-probability moved in the call's direction
+(YES -> price rose, NO -> price fell). This is a market-prediction metric,
+independent of position sizing, so a few concentrated bets cannot masquerade
+as skill the way headline PnL did. The report runs at three horizons
+(+1h/+4h/+24h) so an early read is available before any decision has lived a
+full day — +24h remains the verdict, +1h/+4h are leading indicators.
 
 Run on the server:
     docker compose run --rm api python -m app.modules.llm_scorer.report
@@ -25,6 +27,9 @@ from app.db.models.entities import LLMDecision
 
 _CONF_BUCKETS = ((0.0, 0.5), (0.5, 0.7), (0.7, 0.85), (0.85, 1.01))
 
+_HORIZON_COLUMNS = {"t1h": "price_t1h", "t4h": "price_t4h", "t24h": "price_t24h"}
+_HORIZON_LABELS = {"t1h": "+1h", "t4h": "+4h", "t24h": "+24h"}
+
 
 def _group_stats(items: list[dict]) -> dict:
     n = len(items)
@@ -36,8 +41,13 @@ def _group_stats(items: list[dict]) -> dict:
 
 
 async def build_report(
-    session: AsyncSession, *, near_low: float = 0.15, near_high: float = 0.85
+    session: AsyncSession,
+    *,
+    horizon: str = "t24h",
+    near_low: float = 0.15,
+    near_high: float = 0.85,
 ) -> dict:
+    price_col = _HORIZON_COLUMNS[horizon]
     decisions = list(await session.scalars(select(LLMDecision)))
     by_action = Counter(d.action for d in decisions)
     graded = {
@@ -51,10 +61,11 @@ async def build_report(
     for d in decisions:
         if d.action not in ("open", "adjust") or d.side not in ("YES", "NO"):
             continue
-        if d.price_at_decision is None or d.price_t24h is None:
+        p_future = getattr(d, price_col)
+        if d.price_at_decision is None or p_future is None:
             continue
         p0 = float(d.price_at_decision)
-        p1 = float(d.price_t24h)
+        p1 = float(p_future)
         move = (p1 - p0) if d.side == "YES" else (p0 - p1)
         directional.append(
             {
@@ -89,6 +100,7 @@ async def build_report(
         resolution = {"n": 0, "accuracy": None}
 
     return {
+        "horizon": horizon,
         "total": len(decisions),
         "directional_n": len(directional),
         "by_action": dict(by_action),
@@ -107,23 +119,15 @@ def _signed(value: float | None) -> str:
     return "    n/a" if value is None else f"{value:+.4f}"
 
 
-def format_report(report: dict) -> str:
-    lines: list[str] = []
-    lines.append("=== v5 LLM-trader scorecard ===")
-    lines.append(
-        f"decisions: {report['total']} total | "
-        f"directional graded@24h: {report['directional_n']}"
-    )
-    actions = ", ".join(f"{k}={v}" for k, v in sorted(report["by_action"].items()))
-    lines.append(f"by action: {actions or '(none)'}")
-    g = report["graded"]
-    lines.append(
-        f"graded coverage: t1h={g['t1h']} t4h={g['t4h']} t24h={g['t24h']} "
-        f"resolved={g['resolved']}"
-    )
+def _horizon_block(report: dict) -> list[str]:
+    label = _HORIZON_LABELS[report["horizon"]]
+    lines = [""]
+    lines.append(f"#### horizon {label}  (directional graded: {report['directional_n']})")
+    if report["directional_n"] == 0:
+        lines.append("  (no decisions have reached this horizon yet)")
+        return lines
 
-    lines.append("")
-    lines.append("-- calibration (favorable move @ +24h, by stated confidence) --")
+    lines.append(f"-- calibration (favorable move @ {label}, by stated confidence) --")
     lines.append("  band            n   favorable   avg move")
     for row in report["calibration"]:
         lines.append(
@@ -132,7 +136,7 @@ def format_report(report: dict) -> str:
         )
 
     lines.append("")
-    lines.append("-- edge isolation (decay-harvest separated) --")
+    lines.append(f"-- edge isolation @ {label} (decay-harvest separated) --")
     lines.append("  group              n   favorable   avg move")
     for key in ("all", "near_resolution", "core"):
         s = report["edge"][key]
@@ -141,9 +145,29 @@ def format_report(report: dict) -> str:
             f"{_signed(s['avg_move_in_favor'])}"
         )
     lines.append("  (core = entry prob in (0.15,0.85); the real test of skill)")
+    return lines
+
+
+def format_report(reports: list[dict]) -> str:
+    lines: list[str] = ["=== v5 LLM-trader scorecard ==="]
+    if not reports:
+        return "\n".join(lines)
+
+    overview = reports[-1]  # horizon-independent fields are identical across reports
+    lines.append(f"decisions: {overview['total']} total")
+    actions = ", ".join(f"{k}={v}" for k, v in sorted(overview["by_action"].items()))
+    lines.append(f"by action: {actions or '(none)'}")
+    g = overview["graded"]
+    lines.append(
+        f"graded coverage: t1h={g['t1h']} t4h={g['t4h']} t24h={g['t24h']} "
+        f"resolved={g['resolved']}"
+    )
+
+    for report in reports:
+        lines.extend(_horizon_block(report))
 
     lines.append("")
-    res = report["resolution"]
+    res = overview["resolution"]
     lines.append(
         f"-- resolution accuracy: {res['n']} resolved directional calls, "
         f"side correct: {_pct(res['accuracy'])}"
@@ -156,9 +180,12 @@ def main() -> None:
 
     from app.db.session import SessionLocal
 
-    async def _run() -> dict:
+    async def _run() -> list[dict]:
         async with SessionLocal() as session:
-            return await build_report(session)
+            return [
+                await build_report(session, horizon=h)
+                for h in ("t1h", "t4h", "t24h")
+            ]
 
     print(format_report(asyncio.run(_run())))
 
