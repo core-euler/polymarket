@@ -10,4 +10,5 @@ __pycache__/
 .claude/
 .DS_Store
 alembic/versions/*.py
+docs/research/
 
